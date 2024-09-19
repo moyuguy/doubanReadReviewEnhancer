@@ -16,7 +16,7 @@
 (function() {
     'use strict';
 
-    let ISBN, bookTitle, originalTitle;
+    let ISBN, bookTitle, originalTitle, author;
     let pendingRequests = 0;
     let allRequestsFailed = true;
 
@@ -37,9 +37,33 @@
             const originalTitleMatch = infoElement.textContent.match(/原作名:\s*(.+)/);
             originalTitle = originalTitleMatch ? originalTitleMatch[1].trim() : null;
 
-            if (!ISBN && !bookTitle) {
-                throw new Error('无法从元素中提取ISBN或书名');
+            // 提取作者信息
+            const authorSpan = Array.from(infoElement.querySelectorAll('span.pl')).find(span => 
+                span.textContent.trim().includes('作者')
+            );
+            if (authorSpan) {
+                const authorLink = authorSpan.nextElementSibling;
+                if (authorLink && authorLink.tagName === 'A') {
+                    author = authorLink.textContent.trim();
+                } else {
+                    const authorText = authorSpan.nextSibling ? authorSpan.nextSibling.textContent.trim() : '';
+                    author = authorText ? authorText : null;
+                }
+            } else {
+                throw new Error('无法找到作者信息');
             }
+
+            // 检查所有必要信息是否都已提取
+            const missingInfo = [];
+            if (!ISBN) missingInfo.push('ISBN');
+            if (!bookTitle) missingInfo.push('书名');
+            if (!author) missingInfo.push('作者');
+
+            if (missingInfo.length > 0) {
+                throw new Error(`无法从元素中提取以下信息：${missingInfo.join('、')}`);
+            }
+
+            console.log('提取的图书信息:', { ISBN, bookTitle, originalTitle, author });
 
             const loadingSpan = document.createElement('span');
             loadingSpan.id = 'custom_rating_loading';
@@ -76,15 +100,25 @@
         console.log(`正在获取${platform}评分...`);
         pendingRequests++;
 
-        const searchOrder = [
-            { type: 'ISBN', term: ISBN },
-            { type: '原作名', term: originalTitle },
-            { type: '书名', term: bookTitle }
-        ];
-
-        // 对于微信读书，调整搜索顺序
-        if (platform === 'WeRead') {
-            [searchOrder[1], searchOrder[2]] = [searchOrder[2], searchOrder[1]];
+        let searchOrder;
+        switch (platform) {
+            case 'WeRead':
+                searchOrder = [{ type: '书名', term: bookTitle }];
+                break;
+            case 'Goodreads':
+                searchOrder = [
+                    { type: 'ISBN', term: ISBN },
+                    { type: '原作名', term: originalTitle },
+                    { type: '书名', term: bookTitle }
+                ];
+                break;
+            case 'Amazon':
+                searchOrder = [
+                    { type: 'ISBN', term: ISBN },
+                    { type: '原作名', term: originalTitle },
+                    { type: '书名作者', term: `${bookTitle} ${author}` }
+                ];
+                break;
         }
 
         function tryNextSearch(index) {
@@ -109,13 +143,12 @@
         tryNextSearch(0);
     }
 
-
     function performSearch(platform, term, searchType, callback) {
         const urls = {
             Goodreads: `https://www.goodreads.com/search?q=${encodeURIComponent(term)}`,
             Amazon: `https://www.amazon.com/s?k=${encodeURIComponent(term)}`,
             WeRead: `https://weread.qq.com/web/search/global?keyword=${encodeURIComponent(term)}`
-    };
+        };
 
         GM_xmlhttpRequest({
             method: "GET",
@@ -127,7 +160,7 @@
                             handleGoodreadsSearch(response, callback);
                             break;
                         case 'Amazon':
-                            handleAmazonSearch(response, term, searchType, callback);
+                            handleAmazonSearch(response, callback, searchType);
                             break;
                         case 'WeRead':
                             handleWeReadSearch(response, callback);
@@ -169,16 +202,25 @@
         }
     }
 
-    function handleAmazonSearch(response, searchTerm, searchType, callback) {
+    function handleAmazonSearch(response, callback, searchType) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(response.responseText, "text/html");
-        const results = doc.querySelectorAll('.s-result-item');
 
+        const noResultsElement = doc.querySelector('.s-no-outline');
+        if (noResultsElement && noResultsElement.textContent.includes('No results for')) {
+            console.log('Amazon搜索无结果');
+            callback(false);
+            return;
+        }
+
+        const results = doc.querySelectorAll('.s-result-item');
         for (let result of results) {
             const titleElement = result.querySelector('h2 .a-link-normal');
-            if (titleElement) {
+            const authorElement = result.querySelector('.a-size-base.a-link-normal');
+            if (titleElement && (searchType === 'ISBN' || authorElement)) {
                 const resultTitle = titleElement.textContent.trim();
-                if (isMatchingBook(resultTitle, searchTerm, searchType)) {
+                const resultAuthor = authorElement ? authorElement.textContent.trim() : '';
+                if (isMatchingBook(resultTitle, resultAuthor, searchType)) {
                     const bookLink = 'https://www.amazon.com' + titleElement.getAttribute('href');
                     fetchAmazonRatingFromLink(bookLink);
                     callback(true);
@@ -186,6 +228,7 @@
                 }
             }
         }
+        console.log('Amazon搜索未找到匹配结果');
         callback(false);
     }
 
@@ -208,17 +251,20 @@
         }
     }
 
-    function isMatchingBook(resultTitle, searchTerm, searchType) {
-        const cleanTitle = (title) => title.toLowerCase().replace(/[^\w\s]|_/g, "").replace(/\s+/g, "");
-        const cleanResultTitle = cleanTitle(resultTitle);
-        const cleanSearchTerm = cleanTitle(searchTerm);
-
-        if (searchType === 'ISBN') {
-            return resultTitle.includes(searchTerm);
-        } else if (searchType === '原作名') {
-            return cleanResultTitle === cleanSearchTerm || cleanResultTitle.includes(cleanSearchTerm);
-        } else { // 书名
-            return cleanResultTitle === cleanTitle(bookTitle) || cleanResultTitle.includes(cleanTitle(bookTitle));
+    function isMatchingBook(resultTitle, resultAuthor, searchType) {
+        const cleanStr = (s) => s.toLowerCase().replace(/[^\w\s]/g, '');
+        const cleanResultTitle = cleanStr(resultTitle);
+        const cleanResultAuthor = cleanStr(resultAuthor);
+        
+        switch (searchType) {
+            case 'ISBN':
+                return cleanResultTitle.includes(cleanStr(ISBN));
+            case '原作名':
+                return cleanResultTitle.includes(cleanStr(originalTitle));
+            case '书名作者':
+                return cleanResultTitle.includes(cleanStr(bookTitle)) && cleanResultAuthor.includes(cleanStr(author));
+            default:
+                return false;
         }
     }
 
